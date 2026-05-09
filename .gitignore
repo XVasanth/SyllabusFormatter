@@ -1,0 +1,44 @@
+# ── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ─────────────────────────────────
+venv/
+env/
+.venv/
+.env/
+ENV/
+
+# ── API keys / secrets ───────────────────────────────────
+.env
+.env.*
+secrets.txt
+api_key.txt
+
+# ── Word documents (user files, not part of the project) ─
+*.docx
+*.doc
+# But DO keep the sample file
+!sample/sample_input.docx
+
+# ── OS files ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE / editor files ───────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Logs ─────────────────────────────────────────────────
+*.log
