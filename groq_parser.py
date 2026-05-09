@@ -43,8 +43,20 @@ DEFAULTS = {
     "bold_headings":       True,
     "italic_titles":       True,
     "bold_hours":          True,
+    "bold_topic_headings": True,
     "cell_border_style":   "single",
     "cell_border_color":   "000000",
+    # Reference part formatting
+    "author_italic":       True,
+    "author_bold":         False,
+    "title_italic":        False,
+    "title_bold":          True,
+    "publisher_italic":    False,
+    "publisher_bold":      False,
+    "edition_italic":      False,
+    "edition_bold":        False,
+    "year_italic":         False,
+    "year_bold":           False,
 }
 
 
@@ -106,13 +118,28 @@ cell_border_style=single, cell_border_color=000000
 
 _RUN_SYSTEM_PROMPT = """You are a Word document run-level classifier.
 Given a paragraph with its text runs, classify each run into one of these types:
-  unit_heading  — ALL-CAPS bold heading e.g. "CONCEPTS OF STRESS AND STRAIN:"
-  body          — regular paragraph / sub-topic text
-  lecture_hours — a number in brackets at end of paragraph e.g. "(9)"
-  reference     — a textbook or reference citation line
-  table_header  — first-row table cell content
-  table_body    — non-header table cell content
-  section_label — section labels like "TEXT BOOKS:", "REFERENCES:"
+
+  unit_heading   — ALL-CAPS bold heading e.g. "CONCEPTS OF STRESS AND STRAIN:"
+  topic_heading  — A named topic/sub-topic inside a unit paragraph that acts as
+                   a heading for a concept. These are typically title-case or
+                   sentence-case noun phrases that name a specific engineering
+                   topic e.g. "Shear Stress", "Bending Moment", "Euler's Theory",
+                   "Deflection of Beams". They appear before or between body text
+                   and describe the subject of that section. Bold these.
+  body           — Descriptive or explanatory text — not a topic name.
+                   e.g. "and their applications", "using double integration method"
+  lecture_hours  — A number in brackets at end of paragraph e.g. "(9)"
+  reference      — A textbook or reference citation line
+  table_header   — First-row table cell content
+  table_body     — Non-header table cell content
+  section_label  — Section labels like "TEXT BOOKS:", "REFERENCES:"
+
+Classification rules:
+- If a run is a named concept/topic heading → topic_heading (bold it)
+- If a run is descriptive explanation of a concept → body
+- Lecture-hour counts like (9) at end of paragraph → lecture_hours (bold)
+- When in doubt between topic_heading and body, prefer topic_heading for
+  short noun phrases that clearly name an engineering concept.
 
 Return ONLY a JSON array of objects — no explanation, no markdown, no backticks.
 Format:
@@ -193,6 +220,107 @@ def parse_nlp_instruction(instruction: str, api_key: str) -> dict:
     except Exception as e:
         print(f"[Groq Parser] Unexpected error: {e}")
         return DEFAULTS.copy()
+
+
+# ── Reference parts prompt ────────────────────────────────────────────────────
+
+_REF_PARTS_SYSTEM_PROMPT = """You are an academic reference formatter.
+Given a single reference/citation string, split it into labelled parts.
+
+Part types:
+  author    — the author name(s) at the start
+  title     — the book or article title (may or may not be in quotes)
+  publisher — the publisher name
+  edition   — edition info e.g. "7th edition", "2nd ed."
+  year      — the publication year
+  separator — punctuation/spaces between parts e.g. ", " or ". "
+
+Rules:
+- Split as finely as possible — each distinct piece gets its own object.
+- Keep punctuation (commas, periods, quotes) attached to the nearest part OR as a separator object.
+- Return ONLY a JSON array — no explanation, no markdown fences, no backticks.
+
+Format:
+[
+  {"text": "James M Gere", "part": "author"},
+  {"text": ", ",            "part": "separator"},
+  {"text": "Mechanics of Materials", "part": "title"},
+  {"text": ", ",            "part": "separator"},
+  {"text": "Cengage Learning, Inc", "part": "publisher"},
+  {"text": ", ",            "part": "separator"},
+  {"text": "7th edition",  "part": "edition"},
+  {"text": ", ",            "part": "separator"},
+  {"text": "2008.",         "part": "year"}
+]
+"""
+
+
+def format_reference_parts(reference_text: str, api_key: str,
+                            ref_format: dict) -> list:
+    """
+    Split one reference string into labelled parts using Groq,
+    then apply bold/italic/normal based on ref_format.
+
+    ref_format keys (all bool):
+      author_italic, author_bold
+      title_italic,  title_bold
+      publisher_italic, publisher_bold
+      edition_italic,   edition_bold
+      year_italic,      year_bold
+
+    Returns a list of dicts:
+      [{"text": "...", "bold": bool, "italic": bool}, ...]
+    ready to be written as Word runs.
+
+    Falls back to single unstyled run on any error.
+    """
+    fallback = [{"text": reference_text, "bold": False, "italic": False}]
+
+    if not reference_text.strip() or not api_key.strip():
+        return fallback
+
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": _REF_PARTS_SYSTEM_PROMPT},
+                    {"role": "user",   "content": reference_text},
+                ],
+                "max_tokens": 512,
+                "temperature": 0,
+            },
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            return fallback
+
+        raw = response.json()["choices"][0]["message"]["content"].strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$",       "", raw)
+
+        parts = json.loads(raw)
+
+        # Apply formatting based on part type
+        result = []
+        for part in parts:
+            ptype  = part.get("part", "separator")
+            text   = part.get("text", "")
+            bold   = ref_format.get(f"{ptype}_bold",   False)
+            italic = ref_format.get(f"{ptype}_italic", False)
+            result.append({"text": text, "bold": bold, "italic": italic})
+
+        return result if result else fallback
+
+    except Exception as exc:
+        print(f"[Groq Ref Parts] Error: {exc}")
+        return fallback
 
 
 def classify_paragraph_runs(runs: list, api_key: str) -> list:
