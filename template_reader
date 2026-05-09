@@ -1,0 +1,303 @@
+"""
+template_reader.py
+──────────────────
+Reads a correctly-formatted Word document (the "template"),
+extracts its formatting metadata, sends it to Groq, and gets back
+a complete settings dict that formatter.py can apply to any document.
+
+Flow:
+  1. Read every paragraph + table cell in the template
+  2. Capture font name, size, bold, italic per run
+  3. Classify each paragraph type (unit_heading / body / reference / etc.)
+  4. Send a structured summary to Groq
+  5. Groq returns a JSON settings dict
+  6. Merge with defaults and return
+"""
+
+import json
+import re
+import requests
+from docx import Document
+from docx.shared import Pt
+
+
+# ── Default fallback (if Groq fails) ─────────────────────────────────────────
+
+DEFAULTS = {
+    "page_size":             "A4",
+    "page_border_style":     "none",
+    "page_border_color":     "000000",
+    "page_border_top":       1.0,
+    "page_border_bottom":    1.0,
+    "page_border_left":      1.0,
+    "page_border_right":     1.0,
+    "unit_heading_font":     "Times New Roman",
+    "unit_heading_size":     12,
+    "topic_heading_font":    "Times New Roman",
+    "topic_heading_size":    11,
+    "body_font":             "Times New Roman",
+    "body_size":             11,
+    "table_header_font":     "Arial",
+    "table_header_size":     10,
+    "table_body_font":       "Arial",
+    "table_body_size":       10,
+    "reference_font":        "Times New Roman",
+    "reference_size":        11,
+    "alignment":             "justify",
+    "bold_headings":         True,
+    "bold_topic_headings":   True,
+    "italic_titles":         True,
+    "bold_hours":            True,
+    "italic_hours":          False,
+    "right_align_hours":     True,
+    "cell_border_style":     "single",
+    "cell_border_color":     "000000",
+    "author_italic":         True,
+    "author_bold":           False,
+    "title_italic":          False,
+    "title_bold":            True,
+    "publisher_italic":      False,
+    "publisher_bold":        False,
+    "edition_italic":        False,
+    "edition_bold":          False,
+    "year_italic":           False,
+    "year_bold":             False,
+}
+
+
+# ── Regex helpers ─────────────────────────────────────────────────────────────
+
+_UNIT_HEADING_RE  = re.compile(r"^[A-Z][A-Z\s,/]+:\s")
+_LECTURE_HOURS_RE = re.compile(r"\(\d+\)\s*$")
+_REF_KEYS         = ["TEXT BOOKS", "TEXTBOOKS", "REFERENCES"]
+_END_KEYS         = ["COURSE OUTCOMES", "MAPPING", "ARTICULATION", "TOTAL L"]
+
+
+# ── Template metadata extractor ───────────────────────────────────────────────
+
+def _pt_val(run):
+    """Return font size in pt as float, or None."""
+    try:
+        sz = run.font.size
+        return round(sz.pt, 1) if sz else None
+    except Exception:
+        return None
+
+
+def _run_meta(run):
+    return {
+        "text":   run.text[:80],          # truncate long runs
+        "font":   run.font.name or "",
+        "size":   _pt_val(run),
+        "bold":   bool(run.bold),
+        "italic": bool(run.italic),
+    }
+
+
+def extract_template_metadata(template_path: str) -> dict:
+    """
+    Read the template document and return a structured summary:
+    {
+      "paragraphs": [{"type": ..., "runs": [...], "alignment": ...}, ...],
+      "table_samples": [{"row": 0|1+, "runs": [...]}, ...]
+    }
+    """
+    doc = Document(template_path)
+    paragraphs = []
+    in_ref = False
+
+    for para in doc.paragraphs:
+        text  = para.text.strip()
+        upper = text.upper()
+
+        if not text:
+            continue
+
+        # Determine paragraph type
+        if any(k in upper for k in _REF_KEYS):
+            in_ref = True
+            ptype  = "section_label"
+        elif any(k in upper for k in _END_KEYS):
+            in_ref = False
+            ptype  = "section_label"
+        elif _UNIT_HEADING_RE.match(text):
+            ptype = "unit_heading"
+        elif in_ref and len(text) > 10:
+            ptype = "reference"
+        else:
+            ptype = "body"
+
+        runs = [_run_meta(r) for r in para.runs if r.text.strip()]
+        if not runs:
+            continue
+
+        align = str(para.alignment).split(".")[-1].lower() if para.alignment else "justify"
+
+        # Flag lecture hours
+        has_hours = bool(_LECTURE_HOURS_RE.search(text))
+
+        paragraphs.append({
+            "type":      ptype,
+            "alignment": align,
+            "has_hours": has_hours,
+            "runs":      runs[:6],       # cap to 6 runs per paragraph
+        })
+
+    # Table samples — first 2 rows of first table only
+    table_samples = []
+    if doc.tables:
+        table = doc.tables[0]
+        for row_idx, row in enumerate(table.rows[:2]):
+            for cell in list(row.cells)[:3]:
+                for cell_para in cell.paragraphs:
+                    runs = [_run_meta(r) for r in cell_para.runs if r.text.strip()]
+                    if runs:
+                        table_samples.append({
+                            "row":  row_idx,
+                            "runs": runs[:4],
+                        })
+
+    return {
+        "paragraphs":    paragraphs[:30],    # cap total paragraphs sent
+        "table_samples": table_samples,
+    }
+
+
+# ── Groq system prompt ────────────────────────────────────────────────────────
+
+_SYSTEM_PROMPT = """You are a Word document formatting analyser.
+
+You receive metadata extracted from a correctly-formatted template Word document.
+The metadata shows paragraphs with their types and run-level font details.
+
+Your job: extract the formatting rules and return them as a single JSON object.
+
+JSON keys and types:
+{
+  "unit_heading_font":    "<font name>",
+  "unit_heading_size":    <int pt>,
+  "topic_heading_font":   "<font name>",
+  "topic_heading_size":   <int pt>,
+  "body_font":            "<font name>",
+  "body_size":            <int pt>,
+  "table_header_font":    "<font name>",
+  "table_header_size":    <int pt>,
+  "table_body_font":      "<font name>",
+  "table_body_size":      <int pt>,
+  "reference_font":       "<font name>",
+  "reference_size":       <int pt>,
+  "alignment":            "justify" | "left" | "center" | "right",
+  "bold_headings":        true | false,
+  "bold_topic_headings":  true | false,
+  "italic_titles":        true | false,
+  "bold_hours":           true | false,
+  "italic_hours":         true | false,
+  "right_align_hours":    true | false,
+  "cell_border_style":    "single" | "double" | "none",
+  "cell_border_color":    "<6-digit hex>",
+  "author_italic":        true | false,
+  "author_bold":          true | false,
+  "title_italic":         true | false,
+  "title_bold":           true | false,
+  "publisher_italic":     true | false,
+  "publisher_bold":       true | false,
+  "edition_italic":       true | false,
+  "edition_bold":         true | false,
+  "year_italic":          true | false,
+  "year_bold":            true | false
+}
+
+Rules for inferring values:
+- unit_heading: look at paragraphs with type="unit_heading", use their bold runs
+- body: look at paragraphs with type="body"
+- reference: look at paragraphs with type="reference"
+  - author: typically the first segment before the first comma
+  - title: typically inside quotes or the second segment
+  - publisher: after title
+  - edition: text containing "edition" or "ed."
+  - year: 4-digit number near end
+- table_header: row=0 samples
+- table_body: row=1+ samples
+- right_align_hours: true if has_hours paragraphs show a tab or right alignment
+- For any key you cannot determine from the metadata, use the most common
+  academic document convention (Times New Roman 12pt, etc.)
+
+Return ONLY the JSON object. No explanation. No markdown fences.
+"""
+
+
+# ── Main function ─────────────────────────────────────────────────────────────
+
+def extract_rules_from_template(template_path: str, api_key: str) -> dict:
+    """
+    Read the template doc, send metadata to Groq, return a settings dict.
+    Falls back to DEFAULTS on any error.
+    """
+    # Step 1: extract metadata locally
+    try:
+        metadata = extract_template_metadata(template_path)
+    except Exception as exc:
+        print(f"[Template Reader] Failed to read template: {exc}")
+        return DEFAULTS.copy()
+
+    # Step 2: send to Groq
+    try:
+        payload = json.dumps(metadata, ensure_ascii=False)
+
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":       "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user",   "content": payload},
+                ],
+                "max_tokens":  600,
+                "temperature": 0,
+            },
+            timeout=40,
+        )
+
+        if response.status_code != 200:
+            print(f"[Template Reader] Groq error {response.status_code}")
+            return DEFAULTS.copy()
+
+        raw = response.json()["choices"][0]["message"]["content"].strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$",       "", raw)
+
+        parsed = json.loads(raw)
+
+        # Merge — DEFAULTS fill any missing keys
+        settings = DEFAULTS.copy()
+        settings.update(parsed)
+
+        # Normalise types
+        for key in ("unit_heading_size", "topic_heading_size", "body_size",
+                    "table_header_size", "table_body_size", "reference_size"):
+            settings[key] = int(settings[key])
+        for key in ("page_border_top", "page_border_bottom",
+                    "page_border_left", "page_border_right"):
+            settings[key] = float(settings.get(key, 1.0))
+        for key in ("bold_headings", "bold_topic_headings", "italic_titles",
+                    "bold_hours", "italic_hours", "right_align_hours",
+                    "author_italic", "author_bold", "title_italic", "title_bold",
+                    "publisher_italic", "publisher_bold",
+                    "edition_italic", "edition_bold",
+                    "year_italic", "year_bold"):
+            settings[key] = bool(settings[key])
+        for key in ("page_border_color", "cell_border_color"):
+            settings[key] = str(settings.get(key, "000000")).lstrip("#").upper()
+
+        return settings
+
+    except json.JSONDecodeError as exc:
+        print(f"[Template Reader] JSON parse error: {exc}")
+        return DEFAULTS.copy()
+    except Exception as exc:
+        print(f"[Template Reader] Unexpected error: {exc}")
+        return DEFAULTS.copy()
